@@ -19,6 +19,8 @@ package org.apache.lucene.search;
 
 import java.io.IOException;
 import java.util.BitSet;
+import java.util.Objects;
+import java.util.Set;
 
 import org.apache.lucene.analysis.MockAnalyzer;
 import org.apache.lucene.document.Document;
@@ -30,6 +32,7 @@ import org.apache.lucene.index.Term;
 import org.apache.lucene.search.TimeLimitingCollector.TimeExceededException;
 import org.apache.lucene.search.TimeLimitingCollector.TimerThread;
 import org.apache.lucene.store.Directory;
+import org.apache.lucene.util.Bits;
 import org.apache.lucene.util.Counter;
 import org.apache.lucene.util.LuceneTestCase;
 import org.apache.lucene.util.LuceneTestCase.SuppressSysoutChecks;
@@ -325,6 +328,14 @@ public class TestTimeLimitingCollector extends LuceneTestCase {
     private int slowdown = 0;
     private int lastDocCollected = -1;
     private int docBase = 0;
+    private final boolean disableCache;
+
+    public MyHitCollector() {
+      this(false);
+    }
+    public MyHitCollector(boolean disableCache) {
+      this.disableCache = disableCache;
+    }
 
     /**
      * amount of time to wait on each collect to simulate a long iteration
@@ -368,9 +379,76 @@ public class TestTimeLimitingCollector extends LuceneTestCase {
     
     @Override
     public boolean needsScores() {
-      return false;
+      return disableCache;
     }
 
   }
 
+  public void testAccuracy() throws IOException {
+    long time = -System.currentTimeMillis();
+    TimeExceededException te = expectThrows(TimeExceededException.class, () -> {
+      MyHitCollector coll = new MyHitCollector(true);
+      searcher.search(new SlowQuery(true), createTimedCollector(coll, 1000, false));
+    });
+    time += System.currentTimeMillis();
+    System.out.println("Time waited on a slow query that matches all docs: " + time);
+
+    time = -System.currentTimeMillis();
+    te = expectThrows(TimeExceededException.class, () -> {
+      MyHitCollector coll = new MyHitCollector(true);
+      searcher.search(new SlowQuery(false), createTimedCollector(coll, 1000, false));
+    });
+    time += System.currentTimeMillis();
+    System.out.println("Time waited on a slow query that matches no docs: " + time);
+  }
+  
+  public static class SlowQuery extends Query {
+    private final boolean match;
+    
+    public SlowQuery(boolean match) {
+      this.match = match;
+    }
+
+    @Override
+    public String toString(String field) {
+      return "slow";
+    }
+
+    @Override
+    public boolean equals(Object obj) {
+      if(obj == null) return false;
+      if(obj.getClass() != this.getClass()) return false;
+      return ((SlowQuery)obj).match == this.match;
+    }
+
+    @Override
+    public int hashCode() {
+      return Objects.hashCode(match);
+    }
+
+    @Override
+    public Weight createWeight(IndexSearcher searcher, boolean needsScores, float boost) throws IOException {
+      return new RandomAccessWeight(this,1f) {
+        @Override
+        protected Bits getMatchingDocs(LeafReaderContext context) throws IOException {
+          return new Bits() {
+            @Override
+            public int length() {
+              return context.reader().maxDoc();
+            }
+
+            @Override
+            public boolean get(int index) {
+              try {
+                Thread.sleep(100);
+              } catch (InterruptedException e) {
+                throw new ThreadInterruptedException(e);
+              }
+              return match;
+            }
+          };
+        }
+      };
+    }
+  }
 }
